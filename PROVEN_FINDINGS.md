@@ -488,6 +488,53 @@ Increase `BATCH_STATISTICAL_SECURITY` to at least 10 (giving 80 bits with 8-bit 
 
 ---
 
+## B2: Pi_mod Verifier Uses 64 Rounds Instead of CMP-Specified 80
+
+**Severity:** P4 (Low)
+**CVSS:** 3.7 — AV:N/AC:H/PR:L/UI:N/S:U/C:N/I:L/A:N
+**Preconditions:** Malicious co-signer during key generation
+
+### Bug
+
+The Paillier Blum modulus proof (Pi_mod) is generated with 80 iterations but verified with only 64:
+
+```c
+// paillier_zkp.c:13
+#define PAILLIER_BLUM_STATISTICAL_SECURITY 80  // prover generates 80
+
+// paillier_zkp.c:17
+#define PAILLIER_BLUM_STATISTICAL_SECURITY_MINIMAL_REQUIRED 64  // verifier checks 64
+
+// paillier_zkp.c:1559-1561
+// during development of 2 out of 2 MPC it was decided that
+// PAILLIER_BLUM_STATISTICAL_SECURITY_MINIMAL_REQUIRED is enough
+for (uint32_t i = 0; i < PAILLIER_BLUM_STATISTICAL_SECURITY_MINIMAL_REQUIRED; ++i)
+```
+
+The prover serializes all 80 proof elements. The verifier deserializes all 80 but only checks 64, discarding 16 elements. Soundness drops from 2^-80 to 2^-64.
+
+### Impact
+
+A malicious co-signer has a 2^-64 probability of constructing a non-Blum Paillier modulus that passes verification. While computationally infeasible per attempt, this is below the CMP paper's specified 2^-80 security margin. If a non-Blum Paillier modulus is accepted, MTA range proofs during signing can be forged.
+
+### Proof
+
+Source code evidence:
+```
+Prover:   PAILLIER_BLUM_STATISTICAL_SECURITY = 80         (paillier_zkp.c:13)
+Verifier: PAILLIER_BLUM_STATISTICAL_SECURITY_MINIMAL_REQUIRED = 64  (paillier_zkp.c:17)
+Loop:     for (i = 0; i < 64; ++i)                        (paillier_zkp.c:1561)
+```
+
+### Fix
+
+Change the verifier loop bound to `PAILLIER_BLUM_STATISTICAL_SECURITY`:
+```c
+for (uint32_t i = 0; i < PAILLIER_BLUM_STATISTICAL_SECURITY; ++i)
+```
+
+---
+
 ## Reproduction
 
 ### Build
@@ -544,7 +591,7 @@ Failed:       0
 |---------|----------|------------|
 | CMP ECDSA online signing | F2+F3, F11 | Version downgrade + weak Fiat-Shamir |
 | CMP ECDSA offline signing | F13 | Missing signature verification |
-| CMP key setup | KG1 | Missing Pi_mod for Ring-Pedersen |
+| CMP key setup | KG1, B2 | Missing Pi_mod for RP, Pi_mod 64 vs 80 rounds |
 | CMP key refresh | F8, KR3 | No aux key rotation, no ZKP |
 | Ring-Pedersen parameters | F7 | 1024-bit modulus (half spec) |
 | MTA protocol | F11, B1 | Weak Fiat-Shamir, 40-bit batch |

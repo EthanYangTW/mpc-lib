@@ -361,6 +361,133 @@ Add auxiliary key regeneration to the key refresh flow.
 
 ---
 
+## KG1: Missing Pi_mod Verification for Ring-Pedersen Parameters
+
+**Severity:** P3 (Medium)
+**CVSS:** 5.9 — AV:N/AC:H/PR:L/UI:N/S:U/C:N/I:H/A:N
+**Preconditions:** Malicious co-signer during key generation
+
+### Bug
+
+The CMP paper (Section 4.1, Auxiliary Info Phase) requires both Pi_mod (proof that N is a Blum modulus) AND Pi_prm (proof of discrete log relation between s and t) for Ring-Pedersen parameters. The library only verifies Pi_prm.
+
+**Setup verification** (`cmp_setup_service.cpp:816-823`):
+```cpp
+// Line 816 — Paillier key gets Pi_mod ✓
+paillier_verify_paillier_blum_zkp(i->second.paillier.get(), 1, ...)
+
+// Line 823 — Ring-Pedersen gets Pi_prm ONLY ✗
+ring_pedersen_parameters_zkp_verify(i->second.ring_pedersen.get(), ...)
+```
+
+**Pi_prm only checks** (`ring_pedersen.c:762-878`):
+- N is not prime (line 806)
+- gcd(N, t) = 1 (line 812)
+- gcd(N, s) = 1 (line 817)
+- Knowledge of lambda such that s = t^lambda mod N (lines 841-870)
+
+**Pi_prm does NOT check** (which Pi_mod would):
+- N ≡ 1 mod 4 (Blum integer property)
+- N is a biprime (product of exactly two primes)
+- Factors are safe primes
+
+A malicious co-signer can use a Ring-Pedersen modulus N that is not a Blum integer (e.g., N = p*q*r, a 3-factor modulus, or N with non-safe-prime factors). The Pi_prm proof passes as long as the co-signer knows lambda.
+
+### Impact
+
+With a malformed N, the information-theoretic hiding of Ring-Pedersen commitments C = s^x * t^r mod N may be weakened. However, concrete extraction of key shares requires solving additional equations with unknown masking randomness mu (sampled from [0, N_hat * 2^256) ≈ 2^1280). The masking provides ~2^256 bits of remaining entropy per MTA session, making direct extraction infeasible even with a malformed N. Impact is protocol deviation from the CMP specification — a defense-in-depth failure rather than a directly exploitable vulnerability.
+
+### Proof
+
+Source code evidence only:
+```
+Paillier:       paillier_verify_paillier_blum_zkp() at cmp_setup_service.cpp:816 ✓
+Ring-Pedersen:  ring_pedersen_parameters_zkp_verify() at cmp_setup_service.cpp:823 ✗
+                NO call to paillier_verify_paillier_blum_zkp() for RP modulus
+```
+
+### Fix
+
+Add Pi_mod verification for Ring-Pedersen modulus in `verify_setup_proofs()`:
+```cpp
+paillier_verify_paillier_blum_zkp(
+    /* construct from i->second.ring_pedersen->n */,
+    1, &aad, sizeof(aad),
+    (const paillier_blum_zkp_t*)&i->second.ring_pedersen_zkp);
+```
+
+---
+
+## KR3: Key Refresh Protocol Has No Zero-Knowledge Proofs
+
+**Severity:** P3 (Medium)
+**CVSS:** 6.5 — AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:H/A:N
+**Preconditions:** Malicious co-signer during key refresh
+
+### Bug
+
+The key refresh protocol (`cmp_offline_refresh_service.cpp`) has zero ZKP verification across all three functions: `refresh_key_request()` (lines 24-83), `refresh_key()` (lines 85-205), and `refresh_key_fast_ack()` (lines 207-260). Compare with the CMP paper's key refresh specification which requires Schnorr proofs of correctness for the refresh shares.
+
+Additionally, there is a commit-before-backup race: `refresh_key_fast_ack()` calls `commit()` at line 214 BEFORE `backup_key()` at line 225. If backup fails after commit, the key state is permanently inconsistent.
+
+### Impact
+
+A malicious co-signer can submit an arbitrary refresh share delta. Without ZKP verification, the honest party accepts it, adds it to their key share, and commits. The resulting key share is corrupt — the sum of shares no longer equals the original private key. This is permanent key corruption, not a recoverable error. The old key is overwritten and cannot be restored (backup may have already failed due to the race condition).
+
+### Proof
+
+Source code evidence:
+```
+File: cmp_offline_refresh_service.cpp (260 lines total)
+grep -c "zkp\|proof\|verify\|schnorr" → 0 matches in protocol functions
+Lines 24-83:   refresh_key_request()  — no proofs
+Lines 85-205:  refresh_key()          — no proofs
+Lines 207-260: refresh_key_fast_ack() — no proofs, commit before backup
+```
+
+### Fix
+
+Add Schnorr proofs for refresh shares as specified in the CMP paper. Fix the commit/backup ordering.
+
+---
+
+## B1: 40-bit Statistical Security in Batch Verification
+
+**Severity:** P4 (Low)
+**CVSS:** 3.7 — AV:N/AC:H/PR:L/UI:N/S:U/C:N/I:L/A:N
+**Preconditions:** Malicious co-signer during signing
+
+### Bug
+
+Batch verification of MTA proofs uses BATCH_STATISTICAL_SECURITY = 5 iterations with 8-bit randomizers:
+
+```cpp
+// mta.cpp — batch verification constants
+static const size_t BATCH_STATISTICAL_SECURITY = 5;
+// randomizers sampled from [0, 256) — 8 bits each
+```
+
+Total statistical security: 5 × 8 = 40 bits. The CMP paper and standard practice require at least 80-bit statistical security for batch verification. Individual proof verification provides ~128 bits but batch mode falls far short.
+
+### Impact
+
+A malicious co-signer has a 2^-40 ≈ 10^-12 probability of passing batch verification with a fraudulent proof in any single attempt. While impractical for a single shot, this is below cryptographic standards. With millions of signing sessions (feasible in high-frequency trading scenarios), the probability becomes non-negligible.
+
+### Proof
+
+```
+BATCH_STATISTICAL_SECURITY = 5 at mta.cpp
+randomizer range: [0, 256) = 8 bits
+security: 5 × 8 = 40 bits
+CMP paper requirement: ≥ 80 bits
+```
+
+### Fix
+
+Increase `BATCH_STATISTICAL_SECURITY` to at least 10 (giving 80 bits with 8-bit randomizers) or increase randomizer size to 16+ bits.
+
+---
+
 ## Reproduction
 
 ### Build
@@ -406,3 +533,27 @@ Total tests:  12
 Passed:       18
 Failed:       0
 ```
+
+---
+
+## Audit Coverage Summary
+
+### Attack surfaces thoroughly examined
+
+| Surface | Findings | Assessment |
+|---------|----------|------------|
+| CMP ECDSA online signing | F2+F3, F11 | Version downgrade + weak Fiat-Shamir |
+| CMP ECDSA offline signing | F13 | Missing signature verification |
+| CMP key setup | KG1 | Missing Pi_mod for Ring-Pedersen |
+| CMP key refresh | F8, KR3 | No aux key rotation, no ZKP |
+| Ring-Pedersen parameters | F7 | 1024-bit modulus (half spec) |
+| MTA protocol | F11, B1 | Weak Fiat-Shamir, 40-bit batch |
+| Destructor memory safety | F12 | Heap overflow in OPENSSL_cleanse |
+| EdDSA 2-party signing | F17 | Missing R commitment |
+| BAM ECDSA (asymmetric) | — | Well-designed, no exploitable bugs |
+| HD key derivation | — | Platform-layer responsibility |
+| Platform service interface | — | Trust surface documentation |
+| EdDSA n>2 signing | — | Proper commitments and subgroup checks |
+| Ed25519 algebra | — | Proper cofactor-8 subgroup validation |
+| secp256k1 algebra | — | OpenSSL-backed point validation |
+| Serialization/parsing | — | Under investigation |

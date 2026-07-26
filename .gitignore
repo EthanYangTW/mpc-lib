@@ -37,3 +37,4 @@ build*
 #ide
 .vscode
 attack_poc
+poc_ed25519_nonce_reuse

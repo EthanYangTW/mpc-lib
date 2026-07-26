@@ -39,3 +39,4 @@ build*
 attack_poc
 poc_ed25519_nonce_reuse
 external_attacker_poc
+asan_heap_overflow_poc

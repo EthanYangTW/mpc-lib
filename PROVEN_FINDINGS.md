@@ -603,4 +603,12 @@ Failed:       0
 | EdDSA n>2 signing | — | Proper commitments and subgroup checks |
 | Ed25519 algebra | — | Proper cofactor-8 subgroup validation |
 | secp256k1 algebra | — | OpenSSL-backed point validation |
-| Serialization/parsing | — | Under investigation |
+| STARK curve algebra | — | Same GFp infrastructure, cofactor 1 |
+| Serialization/integer handling | — | No exploitable bugs beyond existing findings |
+| Schnorr ZKP (identity point) | — | Passable but impact is zero key share (no advantage) |
+| Ring-Pedersen degenerate params | — | Pi_prm rejects t=1 when s!=1 |
+| Paillier homomorphic ops | — | Coprimality validated in mul/add |
+| DH log ZKP | — | Correct Sigma protocol implementation |
+| MTA beta generation | — | 1280-bit randomness, properly encrypted |
+| Paillier large factors ZKP | — | Implicit 512-bit min factor (sufficient for ECM) |
+| Timing side channels | — | memcmp on public EC points, not secrets |

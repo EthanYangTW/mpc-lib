@@ -128,6 +128,31 @@ TEST_CASE("POC_01_bam_keygen_client_id_not_bound")
         fbc::bam_ecdsa_cosigner::server_key_shared_data second;
         CHECK_THROWS(victim.server.verify_client_proofs_and_decommit_share_with_proof(key_id, VICTIM_CLIENT_ID, victim_message, second));
         printf("[PoC 1] victim locked out by the replay guard: key is unusable to it\n");
+
+        // Bound on the impact, tested rather than asserted: the attacker CANNOT
+        // go on to sign. bam_ecdsa_cosigner_server.cpp:628 *does* compare
+        // peer_id against client_id on the signing path, and peer_id is still
+        // the victim's. This is what makes the finding key destruction rather
+        // than key theft, so it is verified here instead of taken on trust.
+        const std::string tx_id = new_uuid();
+        elliptic_curve256_scalar_t hash;
+        REQUIRE(RAND_bytes(hash, sizeof(hash)));
+        fbc::signing_data data_to_sign = {{0}, {{ fbc::byte_vector_t(&hash[0], &hash[sizeof(hash)]), {44, 0, 0, 0, 0} }}};
+        std::vector<fbc::bam_ecdsa_cosigner::server_signature_shared_data> server_shares;
+
+        bool attacker_can_sign = true;
+        try
+        {
+            victim.server.generate_signature_share(key_id, tx_id, 0, server_id, ATTACKER_CLIENT_ID,
+                                                   ECDSA_SECP256K1, data_to_sign, "", std::set<std::string>(), server_shares);
+        }
+        catch (const fbc::cosigner_exception&)
+        {
+            attacker_can_sign = false;
+        }
+        printf("[PoC 1] attacker can then sign ... %s\n",
+               attacker_can_sign ? "YES" : "no (blocked by the peer_id check at :628)");
+        CHECK_FALSE(attacker_can_sign);
     }
 }
 

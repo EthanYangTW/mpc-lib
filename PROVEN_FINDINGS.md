@@ -583,6 +583,460 @@ Failed:       0
 
 ---
 
+## OF1: Integer Overflow in ZKP Size Computation → Heap Buffer Over-Read
+
+**Severity:** P2 (High)
+**CVSS:** 7.5 — AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:H
+**Preconditions:** Malicious co-signer during CMP key setup
+
+### Bug
+
+The Paillier Blum ZKP and Ring-Pedersen parameter ZKP serialized size functions use `uint32_t` arithmetic that overflows when given an oversized public key. Neither `paillier_public_key_deserialize` nor `ring_pedersen_public_deserialize_internal` enforce a maximum key size — only a minimum of 256 bits. A malicious CMP participant sends an oversized key (~27MB), which is accepted. When the ZKP is later verified, the size computation overflows to a small value, and the proof deserializer reads `n_len` (~27MB) per field from the undersized proof buffer — a massive heap buffer over-read.
+
+### Affected functions
+
+**Root cause — missing max key size:**
+- `paillier_public_key_deserialize` (`paillier.c:380-427`) — no maximum check on key size
+- `ring_pedersen_public_deserialize_internal` (`ring_pedersen.c:254-320`) — no maximum check on key size
+- `cmp_setup_service::deserialize_auxiliary_keys` (`cmp_setup_service.cpp:622-648`) — only checks minimum size
+
+**Integer overflow in size computation:**
+- `paillier_blum_zkp_serialized_size` (`paillier_zkp.c:840-847`):
+  ```c
+  uint32_t n_len = BN_num_bytes(pub->n);
+  return sizeof(uint32_t) + n_len +
+        (n_len + sizeof(uint8_t) * 2) * 80 +
+        80 * n_len;  // ~161*n_len + 164, overflows at n_len > 26.7M
+  ```
+- `ring_pedersen_param_zkp_serialized_size` (`ring_pedersen.c:597-601`):
+  ```c
+  uint32_t n_len = BN_num_bytes(pub->n);
+  return sizeof(uint32_t) * 2 + (n_len * 2) * 80;  // 160*n_len + 8, overflows at n_len > 26.8M
+  ```
+
+**Heap over-read during proof deserialization:**
+- `deserialize_paillier_blum_zkp` (`paillier_zkp.c:881-920`) — reads `n_len` bytes per field × 80 iterations from undersized buffer
+- `deserialize_ring_pedersen_param_zkp` (`ring_pedersen.c:621-657`) — reads `n_len` bytes per field × 80 iterations from undersized buffer
+
+### Full exploit chain
+
+1. Attacker sends Paillier public key with `n_len ≈ 27MB` during CMP setup
+2. `paillier_public_key_deserialize` accepts it (no max check) → `cmp_setup_service.cpp:625`
+3. `paillier_verify_paillier_blum_zkp(paillier.get(), 1, ...)` is called → `cmp_setup_service.cpp:816`
+4. `paillier_blum_zkp_serialized_size(pub, 1)` overflows `uint32_t`, returns a small value
+5. Attacker crafts `proof_len` to match the overflowed size
+6. `deserialize_paillier_blum_zkp` uses real `n_len` (27MB) for `BN_bin2bn(ptr, n_len, ...)` reads
+7. Each call reads 27MB from the small proof buffer → **heap buffer over-read**
+
+Same chain applies to Ring-Pedersen via `ring_pedersen_parameters_zkp_verify` → `cmp_setup_service.cpp:823`.
+
+### Impact
+
+- **Information disclosure:** Heap over-read exposes adjacent memory contents (potentially key material, random state, other secrets) via BIGNUMs that encode the leaked data
+- **Denial of service:** If over-read crosses page boundary into unmapped memory → SIGSEGV crash
+- **Memory exhaustion:** Even without the overflow, 27MB BIGNUMs and their derived values (N^2 ≈ 54MB) stress memory allocation
+
+### Contrast with safe code
+
+`paillier_commitment_public_key_deserialize` (`paillier_commitment.c:503`) correctly enforces `n_len > PAILLIER_COMMITMENTS_MAX_KEY_SIZE` (8192 bytes). The regular `paillier_public_key_deserialize` has no such check.
+
+### Recommended fix
+
+Add maximum key size checks in both deserializers:
+```c
+// In paillier_public_key_deserialize:
+if (len > MAX_PAILLIER_KEY_BYTES)  // e.g. 1024 for 8192-bit max
+    goto cleanup;
+
+// In ring_pedersen_public_deserialize_internal:
+if (len > MAX_RING_PEDERSEN_KEY_BYTES)
+    goto cleanup;
+```
+
+Additionally, use `uint64_t` for intermediate size computations and check for overflow before casting to `uint32_t`.
+
+---
+
+## OF2: Missing Maximum Key Size in Paillier Public Key Deserialization
+
+**Severity:** P3 (Medium)
+**CVSS:** 6.5 — AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:H
+**Preconditions:** Malicious co-signer during CMP key setup
+
+### Bug
+
+`paillier_public_key_deserialize` (`paillier.c:380-427`) reads a key length from attacker-controlled data and allocates a BIGNUM of that size. The only validation is:
+- `len > buffer_len` (basic bounds check)
+- `BN_num_bits(pub->n) < MIN_KEY_LEN_IN_BITS` (minimum 256 bits)
+
+There is no maximum key size check. An attacker can send arbitrarily large keys, causing:
+1. Memory exhaustion (BIGNUM allocation + N^2 computation)
+2. CPU exhaustion (modular arithmetic on oversized moduli)
+3. Integer overflow in downstream size computations (OF1)
+
+The same issue exists in `ring_pedersen_public_deserialize_internal` (`ring_pedersen.c:254-320`).
+
+This is the root cause enabling OF1. Even without the integer overflow, unbounded key sizes enable resource exhaustion attacks.
+
+### Recommended fix
+
+Match the pattern in `paillier_commitment_public_key_deserialize` which correctly checks `n_len > PAILLIER_COMMITMENTS_MAX_KEY_SIZE`.
+
+---
+
+## KR4: Stale Public Shares After Key Refresh — Persistent Signing Failure
+
+**Severity:** P3 (Medium)
+**CVSS:** 6.5 — AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:H
+**Preconditions:** Malicious co-signer triggers key refresh, then exhausts all preprocessed data
+
+### Bug
+
+The key refresh protocol (`cmp_offline_refresh_service.cpp`) updates each party's private key share by adding a PRF-derived delta, but never updates the corresponding `players_info[id].public_share` values in the key metadata. After refresh, private shares change but public shares remain stale.
+
+**Refresh code** (`cmp_offline_refresh_service.cpp:139-166`):
+```cpp
+// Line 155: Private key share is updated
+algebra->add_scalars(algebra, &key.data, key.data, ..., delta, ...);
+
+// Lines 160-166: Preprocessed data (k, chi) is updated
+algebra->add_scalars(algebra, &preprocess.k.data, preprocess.k.data, ..., k_delta, ...);
+algebra->add_scalars(algebra, &preprocess.chi.data, preprocess.chi.data, ..., chi_delta, ...);
+
+// public_share is NEVER updated — players_info map is not modified
+```
+
+**Where stale public shares are used** (`cmp_ecdsa_signing_service.cpp:189`):
+```cpp
+// MTA x-proof verification checks g^{x_i} against other.public_share
+auto player = key_md.players_info.find(req_it->first);
+// player->second.public_share still holds the PRE-REFRESH value
+```
+
+### Impact
+
+While preprocessed data (k, chi) created BEFORE refresh is usable (the deltas were applied to match the new key shares), once all pre-refresh preprocessed data is exhausted and new presigning must be created, the MTA x-proof verification fails. The prover proves knowledge of x_i' (new share), but the verifier checks against g^{x_i} (old public share). This mismatch causes permanent verification failure — the system can never create new presigning data after refresh.
+
+This survives the veto objection: it is persistent state corruption, not signing denial. Even if all parties are honest and cooperative, they cannot recover without a full key regeneration.
+
+### Proof
+
+Source code evidence:
+```
+File: cmp_offline_refresh_service.cpp
+grep "public_share" → 0 matches in refresh functions
+refresh_key() updates: key.data ✓, preprocess.k ✓, preprocess.chi ✓
+refresh_key() does NOT update: players_info[].public_share ✗
+
+File: cmp_ecdsa_signing_service.cpp:189
+MTA verification uses: player->second.public_share (stale after refresh)
+```
+
+### Fix
+
+After updating the private key share in `refresh_key()`, recompute each player's public share:
+```cpp
+algebra->generator_mul(algebra, &metadata.players_info[my_id].public_share, &key.data);
+```
+
+---
+
+## KR5: Incomplete Player Set Validation in Key Refresh — Silent Key Destruction
+
+**Severity:** P3 (Medium)
+**CVSS:** 6.5 — AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:H/A:H
+**Preconditions:** Malicious coordinator controlling message routing during key refresh
+
+### Bug
+
+The key refresh protocol has no validation that the player set is consistent between phases, and no lower bound on the number of players:
+
+**Phase 1** — `refresh_key_request` (`cmp_offline_refresh_service.cpp:45`):
+```cpp
+if (players_ids.size() > metadata.n) // upper bound only, NO lower bound
+```
+
+**Phase 2** — `refresh_key` (`cmp_offline_refresh_service.cpp:92`):
+```cpp
+if (encrypted_seeds.size() > metadata.n) // upper bound only, NO lower bound
+```
+
+Neither function checks:
+1. That `players_ids.size() == metadata.n` (lower bound)
+2. That the player set in phase 2 matches the player set from phase 1
+3. That all expected players provided seeds
+
+### Exploit scenario
+
+A malicious coordinator omits player C's seed from the messages delivered to players A and B during phase 2:
+1. Player A generates seeds for {A, B, C} and sends them
+2. Player B generates seeds for {A, B, C} and sends them
+3. Coordinator delivers to A: seeds from {A, B} only (omits C's contribution)
+4. Coordinator delivers to B: seeds from {A, B} only (omits C's contribution)
+5. A and B compute deltas from only 2 of 3 players' seeds
+6. The deltas don't cancel: sum(new_shares) ≠ sum(old_shares) = private_key
+7. Key is permanently corrupted
+
+Additionally, at `cmp_offline_refresh_service.cpp:139`:
+```cpp
+player_id_to_seed.at(player_id)  // throws std::out_of_range if player missing
+```
+This can crash the service if a player ID exists in metadata but not in the delivered seeds.
+
+### Impact
+
+The private key is permanently destroyed — shares no longer sum to the original key. The corruption is committed (`refresh_key_fast_ack` line 214) and backed up (line 225), polluting recovery mechanisms. The commit-before-backup ordering means if backup fails after commit, the state is irrecoverable.
+
+This survives the veto objection: a coordinator (who may not be a signing party) causes permanent key destruction that cannot be undone even with all honest parties cooperating.
+
+### Proof
+
+Source code evidence:
+```
+File: cmp_offline_refresh_service.cpp
+Line 45:  players_ids.size() > metadata.n  (upper bound only)
+Line 92:  encrypted_seeds.size() > metadata.n  (upper bound only)
+Line 139: player_id_to_seed.at(player_id)  (throws on missing player)
+Line 214: _key_persistency.commit(key_id)  (before backup at line 225)
+```
+
+### Fix
+
+1. Check exact player set match: `players_ids.size() == metadata.n`
+2. Validate phase 2 player set matches phase 1
+3. Check `player_id_to_seed.count(player_id)` before `.at()` access
+4. Move backup before commit in `refresh_key_fast_ack`
+
+---
+
+## HD1: Hardened HD Derivation Provides No Security Benefit
+
+**Severity:** P3 (Medium)
+**CVSS:** 5.3 — AV:N/AC:H/PR:L/UI:N/S:U/C:H/I:N/A:N
+**Preconditions:** Knowledge of chaincode (shared among all co-signers)
+
+### Bug
+
+All HD key derivation in the MPC library uses a zero private key as the derivation input:
+
+```cpp
+// cmp_ecdsa_signing_service.cpp:269
+static const PrivKey ZERO = {0};
+derive_private_key_generic(algebra, derived_privkey.data, public_key, ZERO, chaincode, path.data(), path.size());
+
+// Same pattern in:
+// bam_ecdsa_cosigner.cpp:206
+// asymmetric_eddsa_cosigner.cpp:29
+// eddsa_online_signing_service.cpp:234
+```
+
+In standard BIP32, hardened derivation uses the private key as HMAC input:
+```
+HMAC-SHA512(chaincode, 0x00 || private_key || child_num)
+```
+
+In this MPC implementation, hardened derivation becomes:
+```
+HMAC-SHA512(chaincode, 0x00 || ZERO_32_bytes || child_num)
+```
+
+This is fully deterministic from the chaincode and path alone — no private key knowledge is needed. The security boundary that hardened derivation is supposed to provide (preventing child key derivation from extended public key alone) is completely absent.
+
+The code silently accepts hardened paths (BIP44 standard uses hardened components: `m/44'/coin'/account'/...`) without rejecting them or documenting that hardened derivation provides no additional security in this MPC context.
+
+### Impact
+
+Anyone who knows the chaincode (which is shared among all co-signers and passed in the `signing_data` struct) can compute the derivation delta for ANY path, including hardened paths. The chaincode combined with the parent public key is sufficient to derive all child public keys, regardless of whether hardened or non-hardened path components are used. This eliminates the BIP32 security boundary between HD subtrees.
+
+### Proof
+
+Source code evidence:
+```
+File: blockchain/mpc/hd_derive.cpp:64-69
+hash_for_derive():
+  if (is_hardened(child_num))
+    return BIP32Hash(out, chaincode, child_num, 0, privkey);  // privkey is always ZERO
+
+File: cmp_ecdsa_signing_service.cpp:269
+  static const PrivKey ZERO = {0};
+
+File: bam_ecdsa_cosigner.cpp:206
+  static const elliptic_curve256_scalar_t ZERO = {0};
+
+File: asymmetric_eddsa_cosigner.cpp:29
+  static const PrivKey ZERO = {0};
+```
+
+### Fix
+
+Either:
+1. Reject hardened derivation paths entirely (return an error when `is_hardened(child_num)` is true), since the MPC design cannot support them securely, OR
+2. Document clearly that hardened derivation provides no additional security in this MPC context
+
+---
+
+## AE1: Asymmetric EdDSA Uses Unsalted Deterministic Commitment (No Hiding)
+
+**Severity:** P3 (Medium)
+**CVSS:** 5.9 — AV:N/AC:H/PR:L/UI:N/S:U/C:H/I:N/A:N
+**Preconditions:** Asymmetric EdDSA signing with n>2 parties
+
+### Bug
+
+The asymmetric EdDSA path uses a custom deterministic commitment scheme in `commit_to_r` (`asymmetric_eddsa_cosigner.cpp:57-68`):
+
+```cpp
+eddsa_commitment asymmetric_eddsa_cosigner::commit_to_r(const std::string& id, uint32_t index,
+    uint64_t player_id, const ed25519_point_t& R)
+{
+    SHA256_CTX sha;
+    SHA256_Init(&sha);
+    SHA256_Update(&sha, id.c_str(), id.size());
+    SHA256_Update(&sha, &index, sizeof(uint32_t));
+    SHA256_Update(&sha, &player_id, sizeof(uint64_t));
+    SHA256_Update(&sha, R, sizeof(ed25519_point_t));
+    eddsa_commitment commitment;
+    SHA256_Final(commitment.data(), &sha);
+    return commitment;
+}
+```
+
+This is `SHA256(id || index || player_id || R)` — completely deterministic with NO random salt.
+
+Compare with the symmetric EdDSA path (`eddsa_online_signing_service.cpp:99`) which uses the standard commitment library:
+```cpp
+commitments_create_commitment_for_data(sigdata.R.data, sizeof(elliptic_curve256_point_t), &commit.data);
+```
+
+The standard commitment library (`commitments.c:15-27`) generates 32 bytes of `RAND_bytes` salt and computes `SHA256(salt || data)`, providing both binding AND hiding properties.
+
+### Impact
+
+The asymmetric EdDSA commitment is deterministic — given the same `(id, index, player_id, R)`, the commitment is always identical. While R has sufficient entropy (~252 bits) to prevent brute-force reversal, the commitment violates the standard cryptographic hiding property. A standard commitment scheme should reveal no information about the committed value, even to an adversary with unbounded computational power. The deterministic scheme leaks a verifiable fingerprint: any party that can guess or enumerate candidate R values can verify which R was committed without waiting for the decommitment phase.
+
+In the n>2 asymmetric EdDSA protocol, commitments are used to prevent adaptive nonce selection. The absence of random salt creates a strictly weaker security guarantee than the symmetric EdDSA path uses for the same purpose.
+
+### Proof
+
+Source code evidence:
+```
+Asymmetric EdDSA commitment (asymmetric_eddsa_cosigner.cpp:57-68):
+  SHA256(id || index || player_id || R)  — NO SALT
+
+Symmetric EdDSA commitment (eddsa_online_signing_service.cpp:99):
+  commitments_create_commitment_for_data(R)
+  → SHA256(RAND_bytes(32) || R)  — 32-BYTE RANDOM SALT
+
+Commitment library (commitments.c:20-25):
+  RAND_bytes(commitment->salt, sizeof(commitments_sha256_t))  // 32 random bytes
+  SHA256(salt || data)
+```
+
+### Fix
+
+Replace the custom `commit_to_r` with the standard commitment library:
+```cpp
+commitments_commitment_t commit;
+commitments_create_commitment_for_data(R, sizeof(ed25519_point_t), &commit);
+```
+
+---
+
+## TC1: Variable-Time Coprimality Check on Attacker-Controlled Data (SGX Timing Side-Channel)
+
+**Severity:** P3 (Medium)
+**CVSS:** 5.9 — AV:N/AC:H/PR:L/UI:N/S:U/C:H/I:N/A:N
+**Preconditions:** SGX deployment, attacker can submit many ciphertexts and measure timing
+
+### Bug
+
+The `is_coprime_fast` function (`algebra_utils.c:327-382`) explicitly warns it does not run in constant time:
+
+```c
+// Checks if two numbers are coprime using GCD (The Euclidean algorithm)
+// WARNING: This function doesn't run in constant time
+int is_coprime_fast(const BIGNUM *in_a, const BIGNUM *in_b, BN_CTX *ctx)
+```
+
+It implements a variable-time Euclidean GCD whose iteration count depends on the input values. This function is called extensively on **attacker-controlled** data across all major protocol paths:
+
+- **Paillier decryption** (`paillier_commitment.c:1182`): `is_coprime_fast(ciphertext, priv->pub.n, ctx)` — BAM server decrypts client's encrypted partial signature
+- **BAM well-formed proof** (`bam_well_formed_proof.cpp:386`): `is_coprime_fast(encrypted_signature, paillier->pub.n, ctx)` — verifies attacker-supplied ciphertext
+- **MTA protocol** (`mta.cpp:413,419,1116,1122,1128,1134`): Multiple coprimality checks on attacker-supplied MTA responses and proof elements
+- **Range proof verification** (`range_proofs.c:697,709,715,720`): Coprimality checks on attacker-supplied ZKP elements
+
+In all these call sites, one operand is attacker-controlled and the other operand is (or is derived from) the Paillier modulus N = p*q, whose factorization is the private key.
+
+### Impact
+
+The GCD computation's execution time varies based on the mathematical relationship between the attacker-controlled input and N's secret factors. In an SGX enclave (the deployment context for this library), cache-timing and branch-timing attacks are well-documented and practical. An attacker who can submit many ciphertexts and measure execution timing (via signing session response times) could gather statistical information about the factorization of N.
+
+The code's own `WARNING` comment acknowledges the timing risk. The function has 30+ call sites, many of which process attacker-controlled data, creating a broad timing oracle surface.
+
+### Proof
+
+Source code evidence:
+```
+algebra_utils.c:326:  // WARNING: This function doesn't run in constant time
+algebra_utils.c:327:  int is_coprime_fast(...)
+
+Attacker-controlled call sites:
+  paillier_commitment.c:1182  — decryption of client ciphertext
+  bam_well_formed_proof.cpp:386  — proof verification of client data
+  mta.cpp:413,419    — MTA response verification
+  mta.cpp:1116,1122  — MTA batch response verification
+  mta.cpp:1128,1134  — MTA batch commitment verification
+  range_proofs.c:697,709,715,720  — ZKP element verification
+```
+
+### Fix
+
+Replace `is_coprime_fast` with a constant-time coprimality check in all paths that handle attacker-controlled data. Use OpenSSL's `BN_gcd` with `BN_FLG_CONSTTIME` flag set on the inputs, or use a modular exponentiation-based approach (Euler's criterion) which has data-independent timing.
+
+---
+
+## AE6: Non-Constant-Time Comparison in Asymmetric EdDSA Partial Signature Verification
+
+**Severity:** P4 (Low)
+**CVSS:** 3.7 — AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:N/A:N
+**Preconditions:** SGX deployment, attacker is EdDSA client
+
+### Bug
+
+The `verify_client_s` function (`asymmetric_eddsa_cosigner_server.cpp:529`) uses `memcmp` for comparing elliptic curve points:
+
+```cpp
+return memcmp(p1, p2, sizeof(elliptic_curve256_point_t)) == 0;
+```
+
+This is a variable-time comparison — `memcmp` returns as soon as it finds the first differing byte. Compare with the commitment verification library (`commitments.c:39`) which correctly uses `CRYPTO_memcmp` (constant-time comparison from OpenSSL).
+
+The comparison verifies whether `s_client * G == (public_share + delta*G) * HRAM + R`. A timing difference reveals how many leading bytes of the client's proposed verification equation match the expected value.
+
+### Impact
+
+In an SGX enclave context, a malicious client could submit many partial signatures and measure the timing of `verify_client_s` to learn byte-by-byte information about the expected verification point. This could theoretically leak information about `public_share * HRAM` (which involves the server's public key share). Practical exploitation requires high-precision timing measurements and many signing sessions.
+
+### Proof
+
+Source code evidence:
+```
+asymmetric_eddsa_cosigner_server.cpp:529:
+  return memcmp(p1, p2, sizeof(elliptic_curve256_point_t)) == 0;  // VARIABLE TIME
+
+commitments.c:39 (correct pattern):
+  CRYPTO_memcmp(hash, commitment->commitment, sizeof(commitments_sha256_t))  // CONSTANT TIME
+```
+
+### Fix
+
+Replace `memcmp` with `CRYPTO_memcmp`:
+```cpp
+return CRYPTO_memcmp(p1, p2, sizeof(elliptic_curve256_point_t)) == 0;
+```
+
+---
+
 ## Audit Coverage Summary
 
 ### Attack surfaces thoroughly examined
@@ -592,23 +1046,33 @@ Failed:       0
 | CMP ECDSA online signing | F2+F3, F11 | Version downgrade + weak Fiat-Shamir |
 | CMP ECDSA offline signing | F13 | Missing signature verification |
 | CMP key setup | KG1, B2 | Missing Pi_mod for RP, Pi_mod 64 vs 80 rounds |
-| CMP key refresh | F8, KR3 | No aux key rotation, no ZKP |
+| CMP key refresh | F8, KR3, KR4, KR5 | No aux key rotation, no ZKP, stale public shares, player set validation |
 | Ring-Pedersen parameters | F7 | 1024-bit modulus (half spec) |
 | MTA protocol | F11, B1 | Weak Fiat-Shamir, 40-bit batch |
 | Destructor memory safety | F12 | Heap overflow in OPENSSL_cleanse |
 | EdDSA 2-party signing | F17 | Missing R commitment |
-| BAM ECDSA (asymmetric) | — | Well-designed, no exploitable bugs |
-| HD key derivation | — | Platform-layer responsibility |
+| Asymmetric EdDSA (n>2) | AE1, AE6 | Unsalted commitment, non-constant-time comparison |
+| BAM ECDSA (asymmetric) | — | Well-designed, 7-step server validation confirmed correct |
+| HD key derivation | HD1 | Hardened derivation provides no security (ZERO private key) |
 | Platform service interface | — | Trust surface documentation |
 | EdDSA n>2 signing | — | Proper commitments and subgroup checks |
 | Ed25519 algebra | — | Proper cofactor-8 subgroup validation |
 | secp256k1 algebra | — | OpenSSL-backed point validation |
 | STARK curve algebra | — | Same GFp infrastructure, cofactor 1 |
-| Serialization/integer handling | — | No exploitable bugs beyond existing findings |
+| Serialization/integer handling | OF1, OF2 | Integer overflow → heap over-read, missing max key size |
 | Schnorr ZKP (identity point) | — | Passable but impact is zero key share (no advantage) |
 | Ring-Pedersen degenerate params | — | Pi_prm rejects t=1 when s!=1 |
 | Paillier homomorphic ops | — | Coprimality validated in mul/add |
 | DH log ZKP | — | Correct Sigma protocol implementation |
 | MTA beta generation | — | 1280-bit randomness, properly encrypted |
 | Paillier large factors ZKP | — | Implicit 512-bit min factor (sufficient for ECM) |
-| Timing side channels | — | memcmp on public EC points, not secrets |
+| Timing side channels | TC1, AE6 | Variable-time is_coprime_fast on attacker data, memcmp in EdDSA verify |
+| DRNG (deterministic RNG) | — | SHA-512 hash chain, correct construction |
+| POSITIVE_R / is_positive | — | Deterministic, consistent across parties |
+| Signature assembly (calc_R) | — | Three-layer delta validation, DH log proof correct |
+| Paillier key generation | — | Correct Blum integer constraints, OpenSSL primality testing |
+| Cross-algorithm isolation | — | Algorithm checks at every signing entry point |
+| VSS / Feldman commitments | — | Correct implementation (not used in CMP n-of-n) |
+| Add user (key redistribution) | — | Share corruption detectable during CMP setup verification |
+| Commitments scheme | AE1 | Standard commitments use salt; asymmetric EdDSA does not |
+| Cross-algorithm key refresh | — | ECDSA preprocessing transform skipped for EdDSA (no data exists) |

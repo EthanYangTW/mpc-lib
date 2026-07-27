@@ -26,3 +26,9 @@ target_include_directories(poc_ring_pedersen_trapdoor PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/common/crypto/commitments)
 target_link_libraries(poc_ring_pedersen_trapdoor PRIVATE cosigner OpenSSL::Crypto)
 add_test(NAME poc_ring_pedersen_trapdoor COMMAND poc_ring_pedersen_trapdoor)
+
+# POC: is the fail-open branch reachable under REAL heap exhaustion?
+add_executable(poc_ring_pedersen_oom_grooming poc_ring_pedersen_oom_grooming.cpp)
+target_include_directories(poc_ring_pedersen_oom_grooming PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/common/crypto/commitments)
+target_link_libraries(poc_ring_pedersen_oom_grooming PRIVATE cosigner OpenSSL::Crypto)

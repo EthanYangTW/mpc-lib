@@ -12,3 +12,5 @@ add_subdirectory(crypto/zero_knowledge_proof)
 add_subdirectory(crypto/paillier_commitment)
 add_subdirectory(crypto/pedersen_commitment)
 add_subdirectory(crypto/algebra_utils)
+add_subdirectory(poc)
+

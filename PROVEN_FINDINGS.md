@@ -1203,14 +1203,247 @@ SHA256_Update(&sha, common_R, sizeof(elliptic_curve256_point_t));
 
 ---
 
+## TC2: Non-Constant-Time Modular Exponentiation with Secret Key Share
+
+**Severity:** P3 (Medium)
+**CVSS:** 5.9 — AV:N/AC:H/PR:L/UI:N/S:U/C:H/I:N/A:N
+**Preconditions:** Malicious co-signer + ability to measure timing
+
+### Bug
+
+In the MTA protocol, `paillier_mul` (paillier.c:1727) computes `c^b mod N^2` where `b` is the party's secret key share or gamma nonce. It uses OpenSSL's standard `BN_mod_exp`, which is NOT constant-time in the exponent:
+
+```c
+// paillier.c:1727
+if (!BN_mod_exp(res, bn_a, bn_b, key->n2, ctx))
+```
+
+The callers pass secrets directly:
+```cpp
+// mta.cpp:719 — secret is gamma (nonce share):
+paillier_mul(paillier.get(), request.message.data(), ..., secret, secret_size, ...)
+
+// cmp_ecdsa_signing_service.cpp:114 — secret is data.gamma.data
+auto beta = mta::answer_mta_request(algebra, ..., data.gamma.data, sizeof(elliptic_curve256_scalar_t), ...)
+
+// cmp_ecdsa_signing_service.cpp:117 — secret is key.data (THE SECRET KEY SHARE)
+beta = mta::answer_mta_request(algebra, ..., key.data, sizeof(elliptic_curve256_scalar_t), ...)
+```
+
+`BN_mod_exp` uses square-and-multiply; the number of multiplications depends on the Hamming weight of the exponent. A malicious co-signer controls the base (`bn_a` — the ciphertext from the MTA request) and can observe response timing.
+
+### Impact
+
+This is distinct from and more severe than TC1 (`is_coprime_fast` timing). TC1 leaks GCD structure of the input. TC2 directly leaks bits of the secret key share through the exponent of the modular exponentiation. Over many signing sessions, a malicious co-signer can extract the honest party's key share bit-by-bit, enabling unilateral signature forgery.
+
+The attack survives the n-of-n veto objection: the malicious co-signer participates normally in signing (no denial) while collecting timing measurements that leak the other party's key share.
+
+### Fix
+
+Use `BN_mod_exp_mont_consttime` instead of `BN_mod_exp`:
+```c
+if (!BN_mod_exp_mont_consttime(res, bn_a, bn_b, key->n2, ctx, NULL))
+```
+
+Also applies to:
+- `paillier_decrypt_openssl_internal` (paillier.c:752) — exponent is `key->lambda`
+- `paillier_commitment_decrypt_openssl_internal` — CRT branches use `BN_mod_exp` with private factors
+
+---
+
+## M1: Premature State Persistence Before Batch Verification (Offline Path)
+
+**Severity:** P3 (Medium)
+**CVSS:** 6.5 — AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:H/A:N
+**Preconditions:** Malicious co-signer in offline preprocessing
+
+### Bug
+
+In the offline MTA verification path (`cmp_ecdsa_offline_signing_service.cpp:222-236`), preprocessing data is persisted to storage INSIDE the processing loop, BEFORE batch verification completes:
+
+```cpp
+// Line 222-228 — processing and storing loop
+for (size_t i = 0; i < metadata.count; i++)
+{
+    ecdsa_preprocessing_data data;
+    _preprocessing_persistency.load_preprocessing_data(request_id, metadata.start_index + i, data);
+    cmp_mta_deltas delta = verify_block_and_get_delta(data, ...);
+    deltas.push_back(std::move(delta));
+    _preprocessing_persistency.store_preprocessing_data(request_id, metadata.start_index + i, data);  // STORED HERE
+}
+
+// Line 231-236 — batch verification happens AFTER all stores
+for (auto it = mta_responses.begin(); it != mta_responses.end(); ++it)
+{
+    if (it->first == my_id) continue;
+    verifiers.at(it->first)->verify();  // VERIFIED HERE — too late
+}
+```
+
+Inside `verify_block_and_get_delta`, the batch verifier's `process()` only accumulates data. The expensive Paillier structural checks (C^z1 * enc(z2,w) == A * D^e) and Ring Pedersen commitment checks are deferred to `verify()`. Meanwhile, `decrypt_mta_response()` folds decrypted alpha values into `data.delta` and `data.chi`, and the corrupted data is persisted.
+
+Contrast with the online path (`cmp_ecdsa_online_signing_service.cpp:310-313`):
+```cpp
+verifiers.at(it->first)->verify();    // line 310 — verified FIRST
+_signing_persistency.update_cmp_signing_data(txid, metadata);  // line 313 — stored AFTER
+```
+
+### Impact
+
+A malicious co-signer crafts MTA responses that pass inline checks (EC point equation, range checks, coprimality) but fail the deferred Paillier/Ring Pedersen batch check. The corrupted preprocessing data (wrong delta/chi from unverified MTA decryption) is written to persistent storage before the batch verification throws an exception. There is no rollback mechanism.
+
+This goes beyond signing denial: the corruption persists across process restarts. Future protocol phases loading this preprocessing data will silently use wrong delta/chi values. The failure manifests in a later phase with opaque errors, not clean MTA verification failures.
+
+### Fix
+
+Move `store_preprocessing_data` after the batch verification loop, or add rollback logic if `verify()` throws.
+
+---
+
+## VD1: Offline Signing protocol_version Unvalidated — Independent Version Downgrade
+
+**Severity:** P3 (Medium)
+**CVSS:** 5.9 — AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:H/A:N
+**Preconditions:** Coordinator controls offline signing request
+
+### Bug
+
+The offline signing function `ecdsa_sign` (`cmp_ecdsa_offline_signing_service.cpp:290`) accepts `protocol_version` from the caller with zero validation:
+
+```cpp
+void cmp_ecdsa_offline_signing_service::ecdsa_sign(
+    ..., int protocol_version, ...)
+{
+    // NO minimum version check
+    // NO check against version negotiated during preprocessing
+
+    if (protocol_version >= MPC_RAND_R_VERSION)  // line 351
+    {
+        // R randomization happens HERE — skipped if protocol_version < 8
+    }
+}
+```
+
+R randomization (introduced at `MPC_RAND_R_VERSION=8`) defends against malicious-R-choice attacks in offline signing by computing `R' = R * H(R, pubkey, message)`. A coordinator that passes `protocol_version=0` skips this entirely.
+
+This is **distinct from F2+F3** (MTA version downgrade):
+- F2+F3 affects the preprocessing path (weakens MTA Fiat-Shamir proofs)
+- VD1 affects the signing path (removes R randomization)
+- Together they form a chain: F2+F3 weakens the proofs during preprocessing, VD1 removes the R randomization defense during signing
+
+### Impact
+
+Without R randomization, the R point used for signing is the exact R from preprocessing. If a malicious party influenced R during preprocessing (made easier by F2+F3's weakened proofs), the deterministic R carries that influence through to the signature unmitigated. This removes a defense-in-depth layer against nonce manipulation.
+
+### Fix
+
+Add version floor: `if (protocol_version < MPC_RAND_R_VERSION) throw cosigner_exception(cosigner_exception::INVALID_PARAMETERS);`
+
+---
+
+## SM1: No Replay Protection on mta_verify — Repeated Calls Corrupt Signing State
+
+**Severity:** P3 (Medium)
+**CVSS:** 5.3 — AV:N/AC:H/PR:L/UI:N/S:U/C:N/I:H/A:N
+**Preconditions:** Malicious coordinator can issue repeated calls
+
+### Bug
+
+The `mta_verify` function (`cmp_ecdsa_online_signing_service.cpp:222-314`) has no one-time execution check. Unlike `mta_response` (which uses the `ack==0` guard at line 138-143), `mta_verify` can be called repeatedly for the same txid:
+
+```cpp
+uint64_t cmp_ecdsa_online_signing_service::mta_verify(const std::string& txid,
+    const std::map<uint64_t, cmp_mta_responses>& mta_responses,
+    std::vector<cmp_mta_deltas>& deltas)
+{
+    // NO one-time execution check
+    // Loads metadata from persistence
+    // verify_block_and_get_delta ACCUMULATES into data.delta, data.chi, data.GAMMA:
+    //   algebra->add_scalars(&data.delta.data, data.delta.data, ..., alpha.data, ...)
+    //   algebra->add_scalars(&data.chi.data, data.chi.data, ..., alpha.data, ...)
+    //   algebra->add_points(&data.GAMMA.data, &data.GAMMA.data, &pub.GAMMA.data)
+    // Stores accumulated state back to persistence
+}
+```
+
+The accumulation operations (`add_scalars`, `add_points`) are additive — if called twice, delta and chi are doubled (or accumulate new values on top). The downstream `calc_R` check (`g^delta == DELTA`) would catch simple doubling, but with carefully crafted MTA responses that produce specific alpha values, the corruption could be targeted.
+
+The implicit protection is that `verify_block_and_get_delta` clears MTA request data via `const_cast` mutations (cmp_ecdsa_signing_service.cpp:182-190) during the first call — this is undefined behavior in C++ (modifying a const reference) and the resulting state depends on compiler optimization choices.
+
+### Impact
+
+Beyond signing denial: if the second call succeeds with different MTA responses (or the same responses are re-accumulated), the signing state has corrupted delta/chi values. The `calc_R` verification provides a backstop in the normal case, but the protocol did not intend for this code path to be reachable. The undefined behavior from `const_cast` mutation makes the outcome compiler-dependent.
+
+### Fix
+
+Add a round marker field to `cmp_signing_metadata` and check/set it in `mta_verify`.
+
+---
+
+## BF1: Missing CRT Verification in Paillier Commitment — Bellcore Fault Attack Surface
+
+**Severity:** P3 (Medium)
+**CVSS:** 5.1 — AV:L/AC:H/PR:H/UI:N/S:U/C:H/I:H/A:N
+**Preconditions:** Hardware fault injection capability (SGX host, voltage glitch)
+
+### Bug
+
+The Paillier commitment encryption uses CRT optimization (`paillier_commitment.c:1014-1036`) but performs no post-CRT verification:
+
+```c
+// paillier_commitment.c:1014-1028 — CRT computation
+// mod p^2 branch:
+BN_mod_mul(mod_p2, priv->pub.n, message, priv->p2, ctx);
+BN_add_word(mod_p2, 1);
+BN_mod_exp(tmp, priv->pub.rho, r_power, priv->p2, ctx);
+BN_mod_mul(mod_p2, mod_p2, tmp, priv->p2, ctx);
+
+// mod q^2 branch:
+BN_mod_mul(mod_q2, priv->pub.n, message, priv->q2, ctx);
+BN_add_word(mod_q2, 1);
+BN_mod_exp(tmp, priv->pub.rho, r_power, priv->q2, ctx);
+BN_mod_mul(mod_q2, mod_q2, tmp, priv->q2, ctx);
+
+// CRT recombination — NO verification
+crt_recombine(ciphertext, mod_p2, priv->p2, mod_q2, priv->q2, ...);
+ret = PAILLIER_SUCCESS;
+// Missing: verify ciphertext mod p^2 == mod_p2
+```
+
+The `assert()` checks in `crt_recombine` (algebra_utils.c:301-303) are compiled out in release builds (`NDEBUG`).
+
+The same vulnerability exists in:
+- `crt_mod_exp` (algebra_utils.c:305-311) used in Paillier commitment decryption
+- `paillier_commitment_commit_with_private_internal` (paillier_commitment.c:1365)
+
+### Impact
+
+In a Bellcore-style fault attack, an attacker induces a hardware fault during one CRT branch. If only `mod_p2` is faulted: `gcd(c_faulty - c_correct, n^2)` reveals `q^2`, factoring `n`. This is especially relevant in SGX environments where the host controls execution.
+
+Factoring N breaks the Paillier commitment scheme, enabling decryption of all encrypted values including partial signatures in BAM ECDSA.
+
+### Fix
+
+Add post-CRT verification:
+```c
+// After crt_recombine:
+if (!BN_mod(tmp, ciphertext, priv->p2, ctx) || BN_cmp(tmp, mod_p2) != 0)
+{
+    ret = PAILLIER_ERROR_UNKNOWN;
+    goto cleanup;
+}
+```
+
+---
+
 ## Audit Coverage Summary
 
 ### Attack surfaces thoroughly examined
 
 | Surface | Findings | Assessment |
 |---------|----------|------------|
-| CMP ECDSA online signing | F2+F3, F11 | Version downgrade + weak Fiat-Shamir |
-| CMP ECDSA offline signing | F13 | Missing signature verification |
+| CMP ECDSA online signing | F2+F3, F11, SM1 | Version downgrade + weak Fiat-Shamir + no replay protection on mta_verify |
+| CMP ECDSA offline signing | F13, M1, VD1 | Missing sig verification, premature persistence, unvalidated protocol_version |
 | CMP key setup | KG1, B2 | Missing Pi_mod for RP, Pi_mod 64 vs 80 rounds |
 | CMP key refresh | F8, KR3, KR4, KR5 | No aux key rotation, no ZKP, stale public shares, player set validation |
 | Ring-Pedersen parameters | F7 | 1024-bit modulus (half spec) |
@@ -1228,12 +1461,12 @@ SHA256_Update(&sha, common_R, sizeof(elliptic_curve256_point_t));
 | Serialization/integer handling | OF1, OF2 | Integer overflow → heap over-read, missing max key size |
 | Schnorr ZKP (identity point) | — | Passable but impact is zero key share (no advantage) |
 | Ring-Pedersen degenerate params | RP1 | Pi_prm rejects t=1 when s!=1, BUT accepts s=1,t=1 simultaneously |
-| Paillier homomorphic ops | — | Coprimality validated in mul/add |
+| Paillier homomorphic ops | TC2, BF1 | Coprimality validated in mul/add; non-constant-time exponentiation; missing CRT verification |
 | DH log ZKP | — | Correct Sigma protocol implementation |
 | MTA beta generation | — | 1280-bit randomness, properly encrypted |
 | Paillier large factors ZKP | FS3 | Wrong Fiat-Shamir salt in quadratic variant |
 | BAM well-formed proof | NB1 | Incomplete Fiat-Shamir binding (missing message, R) |
-| Timing side channels | TC1, AE6 | Variable-time is_coprime_fast on attacker data, memcmp in EdDSA verify |
+| Timing side channels | TC1, TC2, AE6 | Variable-time is_coprime_fast, BN_mod_exp with secret exponent, memcmp in EdDSA verify |
 | DRNG (deterministic RNG) | — | SHA-512 hash chain, correct construction |
 | POSITIVE_R / is_positive | — | Deterministic, consistent across parties |
 | Signature assembly (calc_R) | — | Three-layer delta validation, DH log proof correct |

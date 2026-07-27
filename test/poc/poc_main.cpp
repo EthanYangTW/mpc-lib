@@ -216,44 +216,6 @@ TEST_CASE("POC_02_preprocessing_data_dtor_leaks")
 #endif
 }
 
-// ---------------------------------------------------------------------------
-// PoC 3 -- Finding #10: signing protocol version has no lower bound.
-//
-// src/common/cosigner/cmp_ecdsa_offline_signing_service.cpp:98
-//   if ((uint32_t)version > metadata.version) { throw; }
-//   metadata.version = version;
-//
-// Only the UPPER bound is checked, so any value in [0, MPC_PROTOCOL_VERSION] is
-// accepted -- including 0, and everything below MPC_MIN_SUPPORTED_PROTOCOL_VERSION
-// (mpc_globals.h:12) and below MPC_EXTENDED_MTA (=11). Dropping under
-// MPC_EXTENDED_MTA disables strict_ciphertext_length and selects the legacy
-// Fiat-Shamir transcript that contains the out-of-bounds read of Finding #4.
-//
-// This PoC asserts the property of the guard itself rather than driving a full
-// preprocessing session, so it stays deterministic and fast.
-// ---------------------------------------------------------------------------
-TEST_CASE("POC_03_version_downgrade_has_no_floor")
-{
-    const uint32_t stored_version = fbc::MPC_PROTOCOL_VERSION;
-
-    auto guard_accepts = [stored_version](int version) {
-        // this is the guard as written at cmp_ecdsa_offline_signing_service.cpp:98
-        return !((uint32_t)version > stored_version);
-    };
-
-    printf("\n[PoC 3] MPC_PROTOCOL_VERSION ............... %u\n", (unsigned)fbc::MPC_PROTOCOL_VERSION);
-    printf("[PoC 3] MPC_MIN_SUPPORTED_PROTOCOL_VERSION . %u\n", (unsigned)fbc::MPC_MIN_SUPPORTED_PROTOCOL_VERSION);
-    printf("[PoC 3] MPC_EXTENDED_MTA ................... %u\n", (unsigned)fbc::MPC_EXTENDED_MTA);
-
-    for (int v : {0, 1, 2, 10})
-    {
-        printf("[PoC 3] peer advertises version %-3d -> accepted: %s\n", v, guard_accepts(v) ? "YES" : "no");
-        CHECK(guard_accepts(v));
-    }
-
-    // Everything below MPC_EXTENDED_MTA turns off strict ciphertext length
-    // pinning and selects the legacy MtA transcript.
-    CHECK(guard_accepts(0));
-    CHECK(guard_accepts(fbc::MPC_EXTENDED_MTA - 1));
-    printf("[PoC 3] version 0 accepted -> legacy MtA transcript + strict_ciphertext_length=0  <-- VULNERABLE\n");
-}
+// PoC 3 (protocol version downgrade) was removed: it asserted a locally
+// reimplemented copy of the guard rather than exercising library code, so it
+// contributed no evidence beyond reading cmp_ecdsa_offline_signing_service.cpp:98.

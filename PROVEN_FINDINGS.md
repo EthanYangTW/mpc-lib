@@ -1037,6 +1037,172 @@ return CRYPTO_memcmp(p1, p2, sizeof(elliptic_curve256_point_t)) == 0;
 
 ---
 
+## RP1: Ring Pedersen / Damgard-Fujisaki ZKP Accepts Degenerate Generators (s=1, t=1)
+
+**Severity:** P3 (Medium)
+**CVSS:** 5.3 — AV:N/AC:H/PR:L/UI:N/S:U/C:N/I:H/A:N
+**Preconditions:** Malicious co-signer during CMP key generation
+
+### Bug
+
+The Ring Pedersen parameter ZKP (Pi_prm) and the Damgard-Fujisaki parameter ZKP both accept degenerate generator values s=1 and t=1 simultaneously. Individually, t=1 is rejected when s!=1 (because the proof requires s = t^lambda mod N, which fails for t=1), and s=1 is rejected when t!=1 (for the same reason). But when BOTH s=1 AND t=1, the proof passes trivially because 1 = 1^lambda mod N holds for any lambda.
+
+**Ring Pedersen verification** (`ring_pedersen.c:812-870`):
+```c
+// Lines 812-820: coprimality checks — gcd(N, 1) = 1, always passes
+if (is_coprime_fast(pub->n, pub->t, ctx) != 1) goto cleanup;  // t=1 passes
+if (is_coprime_fast(pub->n, pub->s, ctx) != 1) goto cleanup;  // s=1 passes
+
+// Lines 841-870: Pi_prm verification loop
+// With t=1, s=1: t^z[i] = 1^z[i] = 1 for any z[i]
+// A[i] is supposedly the prover's commitment, but prover can set A[i]=1
+// If e_bit=0: check t^z[i] == A[i] → 1 == 1 ✓
+// If e_bit=1: check t^z[i] == A[i]*s → 1 == 1*1 ✓
+// Trivially passes for all 80 rounds
+```
+
+**Damgard-Fujisaki verification** (`damgard_fujisaki_zkp.c:547-563`):
+Same pattern — coprimality checks pass for value 1, and the structural proof verification trivially passes when both generators are 1.
+
+**Ring Pedersen commitments collapse** (`ring_pedersen.c:897`):
+```c
+BN_mod_exp2_mont(commitment, pub->s, x, pub->t, r, pub->n, ctx, pub->mont)
+// C = s^x * t^r mod N = 1^x * 1^r = 1 for ALL x,r
+```
+
+With s=1 and t=1, every commitment C = 1 regardless of the committed value x and randomness r. The hiding and binding properties both completely break — all values produce the same commitment.
+
+**Deserialization** (`ring_pedersen.c:254-320`) validates BN_num_bits(n) >= 256 and s <= n, t <= n, but does NOT check for s=1 or t=1.
+
+### Impact
+
+In CMP ECDSA, the impact is limited because verifiers use their OWN Ring Pedersen parameters when checking MTA proofs (confirmed at `mta.cpp:971`). A malicious party's degenerate RP parameters would only be used when the malicious party is the verifier — they don't need to verify properly since they can already deny signing. However, degenerate parameters violate the formal security proof's assumptions: the CMP paper requires that Ring Pedersen commitments are computationally hiding and binding, which requires s and t to be non-trivial generators. Accepting s=1,t=1 breaks the soundness argument of the protocol's UC security proof.
+
+### Proof
+
+Source code evidence:
+```
+ring_pedersen.c:812-817  — is_coprime_fast(N, 1) returns 1 (passes)
+ring_pedersen.c:841-870  — Pi_prm verification trivially passes with s=1, t=1
+ring_pedersen.c:897      — C = s^x * t^r = 1^x * 1^r = 1 (commitments collapse)
+ring_pedersen.c:254-320  — No check for s=1 or t=1 in deserialization
+damgard_fujisaki_zkp.c:547-563  — Same degenerate acceptance pattern
+```
+
+### Fix
+
+Add checks for degenerate values in `ring_pedersen_public_deserialize_internal`:
+```c
+if (BN_is_one(pub->s) || BN_is_one(pub->t))
+    goto cleanup;
+```
+
+And similarly in `damgard_fujisaki_zkp_verify`.
+
+---
+
+## FS3: Wrong Fiat-Shamir Salt in Quadratic Large Factors ZKP
+
+**Severity:** P3 (Medium)
+**CVSS:** 5.3 — AV:N/AC:H/PR:L/UI:N/S:U/C:N/I:H/A:N
+**Preconditions:** Malicious co-signer during CMP key setup
+
+### Bug
+
+The codebase defines two distinct Fiat-Shamir salts for Paillier large factors proofs:
+
+```c
+// range_proofs.c:24-26
+#define PAILLIER_LARGE_FACTORS_ZKP_SALT "Range Proof Paillier factors"
+#define PAILLER_LARGE_FACTORS_QUADRATIC_ZKP_SEED "Range Proof Pailler Quadratic for G and H"
+```
+
+The regular large factors proof seed function correctly uses the regular salt:
+```c
+generate_paillier_large_factors_zkp_seed(...)
+    SHA256_Update(&ctx, PAILLIER_LARGE_FACTORS_ZKP_SALT, ...);  // correct
+```
+
+But the QUADRATIC large factors proof seed function also uses the regular salt instead of its own:
+```c
+// range_proofs.c:2196-2197
+generate_paillier_large_factors_quadratic_zkp_seed(...)
+    SHA256_Update(&ctx, PAILLIER_LARGE_FACTORS_ZKP_SALT, ...);  // WRONG — should use PAILLER_LARGE_FACTORS_QUADRATIC_ZKP_SEED
+```
+
+The two proof types are structurally different — the regular proof uses `(A, B)` elements while the quadratic proof uses `(A, B, C)` along with setup parameters `(d, P, Q)`. Using the same salt prefix means the Fiat-Shamir challenge derivation does not distinguish between the two proof types, breaking domain separation.
+
+### Impact
+
+Domain separation in Fiat-Shamir transforms ensures that proofs for one protocol statement cannot be reinterpreted as proofs for a different statement. When two structurally different proof types share the same salt prefix, an adversary could potentially craft a proof transcript that is valid under both interpretations. The dedicated quadratic salt constant was explicitly defined but never used — indicating the developers intended domain separation but failed to wire it up.
+
+### Proof
+
+Source code evidence:
+```
+range_proofs.c:24:  #define PAILLIER_LARGE_FACTORS_ZKP_SALT "Range Proof Paillier factors"
+range_proofs.c:26:  #define PAILLER_LARGE_FACTORS_QUADRATIC_ZKP_SEED "Range Proof Pailler Quadratic for G and H"
+range_proofs.c:2197: SHA256_Update(&ctx, PAILLIER_LARGE_FACTORS_ZKP_SALT, ...)
+                     // Should be: PAILLER_LARGE_FACTORS_QUADRATIC_ZKP_SEED
+```
+
+### Fix
+
+Replace the salt in `generate_paillier_large_factors_quadratic_zkp_seed`:
+```c
+SHA256_Update(&ctx, PAILLER_LARGE_FACTORS_QUADRATIC_ZKP_SEED, sizeof(PAILLER_LARGE_FACTORS_QUADRATIC_ZKP_SEED));
+```
+
+---
+
+## NB1: Incomplete Fiat-Shamir Binding in BAM Well-Formed Proof
+
+**Severity:** P3 (Medium)
+**CVSS:** 5.3 — AV:N/AC:H/PR:L/UI:N/S:U/C:N/I:H/A:N
+**Preconditions:** 2-party BAM ECDSA signing (attacker is client)
+
+### Bug
+
+The BAM ECDSA well-formed proof's Fiat-Shamir challenge (`compute_e` in `bam_well_formed_proof.cpp:163-246`) does not bind to the full signing context. The challenge hash includes:
+
+- `signature_aad` (signing request metadata)
+- `ec_base.h`, `ec_base.f` (elliptic curve base point components)
+- `paillier.n`, `paillier.t`, `paillier.s` (Paillier/RP parameters)
+- `S`, `encrypted_share`, `r_server` (server's ciphertext context)
+- `proof.U`, `proof.V`, `proof.D` (proof commitments)
+
+But it does NOT include:
+
+- **client_R** — the client's nonce point
+- **common_R** — the combined nonce point
+- **message** — the hash of the message being signed
+
+This means the Fiat-Shamir challenge for the well-formed proof is independent of the specific signing transaction. A proof generated for one message/nonce context could potentially be replayed in a different signing context (different message or different R), as long as the Paillier keys and server-side ciphertext context remain the same.
+
+### Impact
+
+The proof demonstrates that the client's encrypted partial signature is well-formed with respect to the server's ciphertext. By not binding to the specific (message, R) pair, the proof's scope is broader than necessary. Concrete exploitation would require the client to be both the attacker and the prover, which limits the direct attack surface — but protocol-level Fiat-Shamir binding should include all public values that define the statement being proved.
+
+### Proof
+
+Source code evidence:
+```
+bam_well_formed_proof.cpp:163-246 — compute_e():
+  Included: signature_aad, ec_base, paillier params, S, encrypted_share, r_server, proof.U/V/D
+  Missing:  client_R, common_R, message hash
+```
+
+### Fix
+
+Include the message hash, client_R, and common_R in the `compute_e` hash:
+```cpp
+SHA256_Update(&sha, message_hash, sizeof(message_hash));
+SHA256_Update(&sha, client_R, sizeof(elliptic_curve256_point_t));
+SHA256_Update(&sha, common_R, sizeof(elliptic_curve256_point_t));
+```
+
+---
+
 ## Audit Coverage Summary
 
 ### Attack surfaces thoroughly examined
@@ -1061,11 +1227,12 @@ return CRYPTO_memcmp(p1, p2, sizeof(elliptic_curve256_point_t)) == 0;
 | STARK curve algebra | — | Same GFp infrastructure, cofactor 1 |
 | Serialization/integer handling | OF1, OF2 | Integer overflow → heap over-read, missing max key size |
 | Schnorr ZKP (identity point) | — | Passable but impact is zero key share (no advantage) |
-| Ring-Pedersen degenerate params | — | Pi_prm rejects t=1 when s!=1 |
+| Ring-Pedersen degenerate params | RP1 | Pi_prm rejects t=1 when s!=1, BUT accepts s=1,t=1 simultaneously |
 | Paillier homomorphic ops | — | Coprimality validated in mul/add |
 | DH log ZKP | — | Correct Sigma protocol implementation |
 | MTA beta generation | — | 1280-bit randomness, properly encrypted |
-| Paillier large factors ZKP | — | Implicit 512-bit min factor (sufficient for ECM) |
+| Paillier large factors ZKP | FS3 | Wrong Fiat-Shamir salt in quadratic variant |
+| BAM well-formed proof | NB1 | Incomplete Fiat-Shamir binding (missing message, R) |
 | Timing side channels | TC1, AE6 | Variable-time is_coprime_fast on attacker data, memcmp in EdDSA verify |
 | DRNG (deterministic RNG) | — | SHA-512 hash chain, correct construction |
 | POSITIVE_R / is_positive | — | Deterministic, consistent across parties |
